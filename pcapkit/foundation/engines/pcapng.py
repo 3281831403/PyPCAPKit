@@ -9,6 +9,7 @@ support, as is used by :class:`pcapkit.foundation.extraction.Extractor`.
 
 """
 import collections
+import functools
 import os
 import sys
 from typing import TYPE_CHECKING, cast
@@ -20,9 +21,11 @@ from pcapkit.corekit.module import ModuleDescriptor
 from pcapkit.corekit.schema.padding import pad_length
 from pcapkit.dumpkit.pcap import PCAPIO
 from pcapkit.foundation.engines.engine import EngineBase
+from pcapkit.foundation.engines.pcapng_pcap import PCAPOutputPlan, plan_pcap_output
 from pcapkit.protocols.misc.pcapng.protocol import PCAPNG as P_PCAPNG
 from pcapkit.protocols.misc.pcapng.schema import (BLOCK_MINIMUM, BYTE_ORDER_MAGIC,
                                                   GENERIC_BLOCK_MINIMUM)
+from pcapkit.toolkit.pcapng import block2frame
 from pcapkit.utilities.exceptions import FormatError, stacklevel
 from pcapkit.utilities.logging import get_logger
 from pcapkit.utilities.warnings import DeprecatedFormatWarning, warn
@@ -41,12 +44,15 @@ if TYPE_CHECKING:
     from pcapkit.protocols.misc.pcapng.data import CustomBlock as Data_CustomBlock
     from pcapkit.protocols.misc.pcapng.data import \
         DecryptionSecretsBlock as Data_DecryptionSecretsBlock
+    from pcapkit.protocols.misc.pcapng.data import EnhancedPacketBlock as Data_EPB
     from pcapkit.protocols.misc.pcapng.data import \
         InterfaceDescriptionBlock as Data_InterfaceDescriptionBlock
     from pcapkit.protocols.misc.pcapng.data import \
         InterfaceStatisticsBlock as Data_InterfaceStatisticsBlock
     from pcapkit.protocols.misc.pcapng.data import NameResolutionBlock as Data_NameResolutionBlock
+    from pcapkit.protocols.misc.pcapng.data import PacketBlock as Data_PacketBlock
     from pcapkit.protocols.misc.pcapng.data import SectionHeaderBlock as Data_SectionHeaderBlock
+    from pcapkit.protocols.misc.pcapng.data import SimplePacketBlock as Data_SPB
     from pcapkit.protocols.misc.pcapng.data import \
         SystemdJournalExportBlock as Data_SystemdJournalExportBlock
     from pcapkit.protocols.misc.pcapng.data import UnknownBlock as Data_UnknownBlock
@@ -115,6 +121,12 @@ class PCAPNG(EngineBase[P_PCAPNG]):
         #: Number of non-packet blocks of each kind written so far, counted
         #: across the whole file rather than per section.
         _block_count: 'collections.Counter[str]'
+        #: Global-header plan for a PCAP output, surveyed before the output
+        #: writer opens; :data:`None` for every other output format.
+        _pcap_plan: 'Optional[PCAPOutputPlan]'
+        #: Whether the PCAP output writer has been opened, so the plan opens it
+        #: once, at the first packet block.
+        _pcap_opened: 'bool'
 
     #: The PCAP-NG magic number this engine claims -- the Block Type of a Section
     #: Header Block, read from its one home,
@@ -161,6 +173,8 @@ class PCAPNG(EngineBase[P_PCAPNG]):
         self._ctx = None  # type: ignore[assignment]
         self._ctx_list = []
         self._block_count = collections.Counter()
+        self._pcap_plan = None
+        self._pcap_opened = False
 
         super().__init__(extractor)
 
@@ -176,9 +190,17 @@ class PCAPNG(EngineBase[P_PCAPNG]):
         block, and then save the related information into the internal
         context storage.
 
+        For PCAP output it first surveys the whole capture for the single
+        global header its per-interface metadata has to collapse into
+        (:func:`~pcapkit.foundation.engines.pcapng_pcap.plan_pcap_output`). The
+        survey runs while no output file exists, so a capture whose packet
+        interfaces disagree on link type is rejected outright rather than
+        converted in part. The writer itself opens at the first packet block.
+
         Raises:
-            FormatError: If the first block is not a section header block, or if
-                the output format is PCAP.
+            FormatError: If the first block is not a section header block, or
+                if the capture cannot be represented as PCAP -- its packet
+                interfaces use more than one link type, or it has no packets.
 
         """
         ext = self._extractor
@@ -194,12 +216,60 @@ class PCAPNG(EngineBase[P_PCAPNG]):
 
         logger.debug('PCAP-NG section %d header read', len(self._ctx_list))
 
-        # NOTE: a PCAP file has one link type and one timestamp resolution,
-        # where a PCAP-NG file declares them per interface, in blocks that follow.
-        if not ext._flag_q and isinstance(ext._ofile, type) and issubclass(ext._ofile, PCAPIO):
-            raise FormatError('PCAP-NG: PCAP output is not supported for a PCAP-NG input')
+        if ext._flag_q:
+            return
+
+        # NOTE: a PCAP file has one link type, one snapshot length, one timestamp
+        # resolution and one byte order, where a PCAP-NG file declares them per
+        # interface, in blocks that follow. The survey reads the block framing only
+        # and leaves the input position where it found it, so the extraction pass
+        # below re-parses the section header as if the survey had never run.
+        if isinstance(ext._ofile, type) and issubclass(ext._ofile, PCAPIO):
+            try:
+                self._pcap_plan = plan_pcap_output(ext._ifile)
+            except FormatError:
+                # The survey rejected the capture before the writer opened, but
+                # split mode's output directory was created while the extractor
+                # was being built. A refused forensic conversion leaves nothing
+                # behind, so remove it while it is still empty and re-raise.
+                self._discard_unopened_pcap_output()
+                raise
+            logger.debug(
+                'PCAP-NG to PCAP plan: link type %s, snaplen %d, nanosecond %s, byte order %s',
+                self._pcap_plan.linktype, self._pcap_plan.snaplen,
+                self._pcap_plan.nanosecond, self._pcap_plan.byteorder)
+            # NOTE: the writer opens lazily at the first packet block with the plan's
+            # global-header fields, but the flag has to be set now: Extractor.run
+            # calls _open_output again once the engine has started, and the no-arg
+            # call cannot build a PCAPIO, which requires a link type.
+            ext._flag_o = True
+            return
+
         ext._open_output()
         self._write_file(shb.info, name=f'Section Header {len(self._ctx_list)}')
+
+    def _discard_unopened_pcap_output(self) -> 'None':
+        """Remove the split-mode output directory when no writer ever opened.
+
+        :meth:`~pcapkit.foundation.extraction.Extractor.make_name` creates the
+        per-frame output directory while the extractor is built, before the
+        survey has had a chance to reject the capture. The non-split output is
+        only a path with no file on disk until the writer opens, so only split
+        mode has anything to discard, and only while the directory is empty --
+        a directory that already holds files is never the survey's to remove.
+
+        """
+        ext = self._extractor
+        # ``getattr`` because the survey can run on a throwaway engine built by
+        # Extractor.record_header rather than the extractor's own engine.
+        if not ext._flag_f or getattr(self, '_pcap_opened', False) or not ext._ofnm:
+            return
+        try:
+            os.rmdir(ext._ofnm)
+        except OSError:
+            # Not empty, or already gone: never delete a directory holding data.
+            logger.debug('kept split output directory %r after a rejected PCAP plan',
+                         ext._ofnm, exc_info=True)
 
     def read_frame(self) -> 'P_PCAPNG':
         """Read frames.
@@ -278,6 +348,7 @@ class PCAPNG(EngineBase[P_PCAPNG]):
             elif block.info.type == Enum_BlockType.Enhanced_Packet_Block:
                 # NOTE: as for the ISB above, the interface ID has already been
                 # bounds-checked by ``PCAPNG._get_interface`` while parsing.
+                self._open_pcap_output()
                 break
 
             elif block.info.type == Enum_BlockType.Simple_Packet_Block:
@@ -287,6 +358,7 @@ class PCAPNG(EngineBase[P_PCAPNG]):
                 # to use an EPB instead (Section 4.4 of the PCAP-NG specification)
                 if not self._ctx.interfaces:
                     raise FormatError('PCAP-NG: [SPB] section has no interface description block')
+                self._open_pcap_output()
                 break
 
             elif block.info.type == Enum_BlockType.Packet_Block:
@@ -294,6 +366,7 @@ class PCAPNG(EngineBase[P_PCAPNG]):
                 # bounds-checked by ``PCAPNG._get_interface`` while parsing.
                 warn('PCAP-NG: [Packet] deprecated block type', DeprecatedFormatWarning,
                      stacklevel=stacklevel())
+                self._open_pcap_output()
                 break
 
             else:
@@ -307,7 +380,10 @@ class PCAPNG(EngineBase[P_PCAPNG]):
         ext._vfunc(ext, block)
 
         # write output
-        self._write_file(block.info, name=f'Frame {ext._frnum}')
+        if self._pcap_plan is not None:
+            self._write_pcap_frame(block)
+        else:
+            self._write_file(block.info, name=f'Frame {ext._frnum}')
 
         # record fragments
         if ext._flag_r:
@@ -379,6 +455,13 @@ class PCAPNG(EngineBase[P_PCAPNG]):
         if ext._flag_q:
             return
 
+        # NOTE: a PCAP file holds only packet records; section headers, interface
+        # descriptions and every other non-packet block have no representation in
+        # it and are skipped. The global header their metadata collapses into is
+        # written when the first packet block opens the writer.
+        if self._pcap_plan is not None:
+            return
+
         if ext._flag_f:
             ofile = ext._ofile(f'{ext._ofnm}/{name}.{ext._fext}')
             ofile(block, name=name)
@@ -386,6 +469,73 @@ class PCAPNG(EngineBase[P_PCAPNG]):
             ext._ofile(block, name=name)
             ofile = ext._ofile
         ext._offmt = ofile.kind
+
+    def _open_pcap_output(self) -> 'None':
+        """Open the PCAP writer at the first packet block, from the survey plan.
+
+        The global header a PCAP file opens with cannot be written until the
+        survey (:func:`~pcapkit.foundation.engines.pcapng_pcap.plan_pcap_output`)
+        has settled the link type, snapshot length, timestamp resolution and
+        byte order; :meth:`run` ran that survey and kept the plan, and the first
+        packet block is the first moment writing it is correct. Later calls are
+        no-ops, so one writer serves every frame.
+
+        :meth:`Extractor._open_output
+        <pcapkit.foundation.extraction.extraction.Extractor._open_output>` is
+        not reused: :meth:`run` already set its opened flag, so the no-arg call
+        the extractor makes once an engine has started stays a no-op, as it must
+        for the engines that open nothing themselves. The writer is therefore
+        instantiated here directly, the same call that method would make, with
+        the plan's global-header fields.
+
+        """
+        ext = self._extractor
+        if self._pcap_plan is None or self._pcap_opened or ext._flag_q:
+            return
+        plan = self._pcap_plan
+
+        if ext._flag_f:
+            # NOTE: bind the global-header fields onto the factory, so the per-frame
+            # writer each call builds opens with the same global header.
+            factory = cast('Any', ext._ofile)
+            ext._ofile = functools.partial(
+                factory, protocol=plan.linktype, byteorder=plan.byteorder,
+                nanosecond=plan.nanosecond, snaplen=plan.snaplen)
+        else:
+            writer_cls = cast('Any', ext._ofile)
+            ext._ofile = writer_cls(
+                ext._ofnm, protocol=plan.linktype, byteorder=plan.byteorder,
+                nanosecond=plan.nanosecond, snaplen=plan.snaplen)
+            ext._offmt = ext._ofile.kind
+        self._pcap_opened = True
+
+    def _write_pcap_frame(self, block: 'P_PCAPNG') -> 'None':
+        """Write one packet block to the PCAP output as a PCAP record.
+
+        The block is converted with
+        :func:`~pcapkit.toolkit.pcapng.block2frame`, the same adapter the flow
+        tracer uses, so the record carries the block's own captured octets and
+        timestamp; :class:`~pcapkit.dumpkit.pcap.PCAPIO` rescales the fraction
+        to the output file's resolution.
+
+        Args:
+            block: The parsed packet block.
+
+        """
+        ext = self._extractor
+        if ext._flag_q or self._pcap_plan is None:
+            return
+
+        packet_info = cast('Data_EPB | Data_SPB | Data_PacketBlock', block.info)
+        frame = block2frame(packet_info, nanosecond=self._pcap_plan.nanosecond)
+        frnum = f'Frame {ext._frnum}'
+        if ext._flag_f:
+            ofile = ext._ofile(f'{ext._ofnm}/{frnum}.{ext._fext}')
+            ofile(frame, name=frnum)
+            ext._offmt = ofile.kind
+        else:
+            ext._ofile(frame, name=frnum)
+            ext._offmt = ext._ofile.kind
 
     def _peek_block_type(self) -> 'Optional[int]':
         """Read the block type of the next block without consuming it.

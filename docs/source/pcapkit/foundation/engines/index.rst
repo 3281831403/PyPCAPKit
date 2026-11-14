@@ -125,9 +125,16 @@ offers says so rather than quietly doing less, unless its row says otherwise:
 | :class:`~pcapkit.foundation.engines.pcap_ct.PCAP_CT` and        |                                                               |
 | :class:`~pcapkit.foundation.engines.pypcapfile.PyPCAPFile`      |                                                               |
 +-----------------------------------------------------------------+---------------------------------------------------------------+
-| :class:`~pcapkit.foundation.engines.pcapng.PCAPNG`              | no PCAP output for a PCAP-NG input, which declares its link   |
-|                                                                 | type and timestamp resolution per interface --                |
-|                                                                 | :exc:`~pcapkit.utilities.exceptions.FormatError`              |
+| :class:`~pcapkit.foundation.engines.pcapng.PCAPNG`              | PCAP output for a PCAP-NG input collapses its per-interface     |
+|                                                                 | link type, snapshot length and timestamp resolution into one    |
+|                                                                 | global header: the link type of the interfaces that carry       |
+|                                                                 | packets, which must all agree, their largest snapshot length,   |
+|                                                                 | the finest timestamp resolution (nanoseconds preferred over     |
+|                                                                 | microseconds) and the byte order of the first packet section.   |
+|                                                                 | A capture whose packet interfaces disagree on link type, or    |
+|                                                                 | one with no packet blocks, raises                               |
+|                                                                 | :exc:`~pcapkit.utilities.exceptions.FormatError` before any    |
+|                                                                 | output file is written                                          |
 +-----------------------------------------------------------------+---------------------------------------------------------------+
 
 Availability

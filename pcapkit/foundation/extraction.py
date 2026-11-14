@@ -833,8 +833,10 @@ class Extractor(Generic[_P]):
 
         Raises:
             FormatError: If the selected engine cannot read the input's format --
-                for the :term:`default engine`, if it is neither PCAP nor PCAP-NG -- or if
-                the built-in PCAP-NG engine reads a PCAP-NG input to PCAP output.
+                for the :term:`default engine`, if it is neither PCAP nor PCAP-NG -- or,
+                when a PCAP-NG input is written to PCAP output, if its packet
+                interfaces use more than one link type or the capture has no
+                packet blocks.
 
         :rtype: None
         """

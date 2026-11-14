@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import decimal
 import importlib.util
 from ipaddress import ip_address
 import types
@@ -272,6 +273,21 @@ class PCAPToolkitTests(unittest.TestCase):
 
         pcap_frame_ns = toolkit.block2frame(block, nanosecond=True)
         self.assertEqual(pcap_frame_ns.frame_info.ts_usec, 250000000)
+
+        # A timestamp whose fraction a float product cannot hold exactly must
+        # still convert exactly through the Decimal path. 1.001 s is 1,000,000
+        # ns, but ``int((float(epoch) - 1) * 1e9)`` truncates the float to
+        # 999,999 -- a one-nanosecond loss a forensic conversion cannot make.
+        precise = types.SimpleNamespace(
+            timestamp_epoch=decimal.Decimal('1.001'), timestamp='time',
+            captured_len=4, original_len=4, number=1, packet=b'abcd')
+        precise_ns = toolkit.block2frame(precise, nanosecond=True)
+        self.assertEqual((precise_ns.frame_info.ts_sec, precise_ns.frame_info.ts_usec),
+                         (1, 1_000_000))
+        # the same instant in microseconds truncates to a whole millisecond
+        precise_us = toolkit.block2frame(precise, nanosecond=False)
+        self.assertEqual((precise_us.frame_info.ts_sec, precise_us.frame_info.ts_usec),
+                         (1, 1000))
 
     def test_tcp_reassembly_descriptor_bounds_are_absolute_and_inclusive(self) -> None:
         """The segment descriptor handed to the reassembler (GitHub issue #349).

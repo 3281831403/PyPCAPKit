@@ -10,6 +10,7 @@ The reassembly and flow tracing adapters return the data their
 cannot be used for it.
 
 """
+import decimal
 from typing import TYPE_CHECKING, cast
 
 from pcapkit.const.ipv6.extension_header import ExtensionHeader as Enum_ExtensionHeader
@@ -264,9 +265,19 @@ def block2frame(block: 'Packet', *, nanosecond: 'bool' = False) -> 'Data_Frame':
     Returns:
         PCAP frame.
 
+    Note:
+        The fraction is derived from the block's exact timestamp with
+        :class:`decimal.Decimal` integer arithmetic and **truncated**, never
+        rounded, to the requested unit. A float product would round a value a
+        binary timestamp resolution carries exactly -- e.g. ``0.00048828125``
+        seconds at an ``if_tsresol`` of ``2**-20`` -- and silently drop its
+        finest octets, which a forensic conversion is not allowed to do.
+
     """
-    ts_sec = int(block.timestamp_epoch)
-    ts_usec = int((block.timestamp_epoch - ts_sec) * RESOLUTION[bool(nanosecond)])
+    epoch = decimal.Decimal(block.timestamp_epoch)
+    units = RESOLUTION[bool(nanosecond)]
+    ticks = int(epoch * units)  # truncates toward zero, as libpcap scales down
+    ts_sec, ts_usec = divmod(ticks, units)
 
     frame = Data_Frame(
         frame_info=Data_FrameInfo(
